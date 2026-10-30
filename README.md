@@ -121,3 +121,6 @@ Note: on YD-ESP32-S3 clone boards the 5 V pin may need the IN-OUT solder pad bri
 - `images/aurora.png`: background image. Regenerated approximation of the original (the exact file wasn't recoverable); `tools/generate_aurora.py` recreates it.
 - Copy `access-panel-front.yaml`, `components/` and `images/` into your ESPHome config folder (e.g. `homeassistant/esphome/`).
 - Lock relay, reed switch and exit button are not in this YAML yet.
+
+## Building
+GitHub Actions compiles the firmware on every push (`.github/workflows/build.yml`) using placeholder Wi-Fi secrets. Check the Actions tab to confirm the code compiles. For a device you'll actually flash, build locally in ESPHome with your real `secrets.yaml`, since the CI binary has dummy Wi-Fi details.

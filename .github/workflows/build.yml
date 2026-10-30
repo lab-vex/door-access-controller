@@ -1,0 +1,48 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ESPHome
+        run: pip install esphome==2026.9.1
+
+      # Placeholder secrets so the build works without real Wi-Fi details
+      - name: Create dummy secrets
+        run: |
+          printf 'iot_wifi_ssid: "CHANGE_ME"\niot_wifi_password: "CHANGE_ME"\n' > secrets.yaml
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .esphome
+          key: esphome-2026.9.1-${{ hashFiles('access-panel-front.yaml') }}
+          restore-keys: esphome-2026.9.1-
+
+      - name: Compile
+        run: esphome compile access-panel-front.yaml
+
+      - name: Collect binaries
+        run: |
+          mkdir -p out
+          cp .esphome/build/access-panel-front/.pioenvs/access-panel-front/firmware.bin out/ || true
+          cp .esphome/build/access-panel-front/.pioenvs/access-panel-front/firmware.factory.bin out/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: access-panel-front-firmware
+          path: out/
+          if-no-files-found: warn
