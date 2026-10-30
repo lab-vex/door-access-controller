@@ -1,0 +1,847 @@
+substitutions:
+  # Your Home Assistant weather entity (Settings > Entities, search "weather")
+  weather_entity: weather.forecast_home
+
+esphome:
+  name: access-panel-front
+  friendly_name: Access Panel Front
+  on_boot:
+    - priority: -100
+      then:
+        - if:
+            condition:
+              switch.is_on: auto_brightness_switch
+            then:
+              - lambda: 'id(last_auto_brightness) = -1;'
+              - script.execute: auto_brightness
+            else:
+              - script.execute: apply_manual_brightness
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret iot_wifi_ssid
+  password: !secret iot_wifi_password
+
+# The access_control folder sits next to this file in esphome/components/
+external_components:
+  - source:
+      type: local
+      path: components
+
+# FP008 face/palm module
+uart:
+  - id: fp008_uart
+    tx_pin: GPIO17   # -> FP008 pin 4 (RXD)
+    rx_pin: GPIO18   # <- FP008 pin 3 (TXD)
+    baud_rate: 115200
+  # HLK-LD2450 mmWave radar
+  - id: ld2450_uart
+    tx_pin: GPIO2    # -> LD2450 RX
+    rx_pin: GPIO8    # <- LD2450 TX
+    baud_rate: 256000
+    parity: NONE
+    stop_bits: 1
+
+ld2450:
+  id: door_radar
+  uart_id: ld2450_uart
+
+binary_sensor:
+  - platform: ld2450
+    ld2450_id: door_radar
+    has_target:
+      id: radar_presence
+      name: Front Door Presence
+      filters:
+        - delayed_off: 30s       # stay "present" 30 s after they leave
+      on_press:
+        - lambda: 'id(last_auto_brightness) = -1;'
+        - script.execute: auto_brightness
+      on_release:
+        - lambda: 'id(last_auto_brightness) = -1;'
+        - script.execute: auto_brightness
+
+access_control:
+  id: door_access
+  uart_id: fp008_uart
+  presence_pin: GPIO16   # FP008 pin 5 (IRQ): only scan when someone is in front
+  identify_timeout: 8s
+  enrol_timeout: 20s
+  on_access:
+    - lvgl.label.update:
+        id: status_label
+        text: !lambda 'return std::string(granted ? "Welcome " : "Access denied\n") + (granted ? name : method);'
+        text_color: !lambda 'return granted ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171);'
+    - script.execute: reset_status
+    - text_sensor.template.publish:
+        id: last_access
+        state: !lambda 'return (granted ? "Granted: " : "Denied: ") + name + " (" + method + ")";'
+    - homeassistant.event:
+        event: esphome.access_panel_access
+        data:
+          method: !lambda 'return method;'
+          name: !lambda 'return name;'
+          granted: !lambda 'return granted ? "true" : "false";'
+
+# Card reader
+wiegand:
+  - id: card_reader
+    d0: GPIO38
+    d1: GPIO39
+    on_tag:
+      - lambda: 'id(door_access).handle_card(x);'
+
+# ---------------------------------------------------------------------------
+# Speaker: MAX98357A I2S amp
+# ---------------------------------------------------------------------------
+i2s_audio:
+  - id: i2s_out
+    i2s_lrclk_pin: GPIO13   # -> amp LRC
+    i2s_bclk_pin: GPIO14    # -> amp BCLK
+
+speaker:
+  - platform: i2s_audio
+    id: amp_speaker
+    i2s_audio_id: i2s_out
+    i2s_dout_pin: GPIO15    # -> amp DIN
+    dac_type: external
+    channel: mono
+    sample_rate: 48000
+    bits_per_sample: 16bit
+
+# Shows in HA as a media player: TTS, chimes and test sounds
+media_player:
+  - platform: speaker
+    id: door_speaker
+    name: Door Speaker
+    volume_initial: 0.6
+    announcement_pipeline:
+      speaker: amp_speaker
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+
+# ---------------------------------------------------------------------------
+# Touchscreen (3.5" ST7796, FT6336 touch)
+# ---------------------------------------------------------------------------
+spi:
+  - id: display_spi
+    clk_pin: GPIO12
+    mosi_pin: GPIO11
+
+i2c:
+  - id: touch_i2c
+    sda: GPIO5
+    scl: GPIO6
+    scan: true          # touch chip should show at 0x38
+
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO7
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: Screen Backlight
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 300ms
+    internal: true          # controlled by the "Screen Brightness" slider below
+
+# Brightness slider in HA (0 % turns the backlight off)
+number:
+  - platform: template
+    id: screen_brightness
+    name: Screen Brightness
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 80
+    on_value:
+      # Only drives the backlight while Auto Brightness is off
+      - if:
+          condition:
+            switch.is_off: auto_brightness_switch
+          then:
+            - script.execute: apply_manual_brightness
+
+display:
+  - platform: mipi_spi
+    id: door_display
+    spi_id: display_spi
+    model: ST7796
+    cs_pin: GPIO10
+    dc_pin: GPIO9       # LCD_RS
+    data_rate: 40MHz
+    invert_colors: true
+    rotation: 0         # change to 90/180/270 to suit mounting
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  - platform: ft63x6
+    id: door_touch
+    i2c_id: touch_i2c
+    interrupt_pin: GPIO4
+
+# ---------------------------------------------------------------------------
+# Fonts (downloaded when ESPHome compiles)
+# ---------------------------------------------------------------------------
+font:
+  - file:
+      type: web
+      url: https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf
+    id: font_text
+    size: 22
+    glyphs: [" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°•"]
+  - file:
+      type: web
+      url: https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf
+    id: font_small
+    size: 18
+    glyphs: [" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°•"]
+  - file:
+      type: web
+      url: https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Medium.ttf
+    id: font_clock
+    size: 88
+    glyphs: ["0123456789: "]
+  - file:
+      type: web
+      url: https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf
+    id: font_weather
+    size: 26
+    glyphs: [" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~°•"]
+    extras:
+      - file:
+          type: web
+          url: https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf
+        glyphs: ["\U000F0599", "\U000F0594", "\U000F0590", "\U000F0595", "\U000F0F31", "\U000F0597", "\U000F0596", "\U000F0593", "\U000F067E", "\U000F0591", "\U000F0592", "\U000F0598", "\U000F067F", "\U000F059D", "\U000F059E", "\U000F05D6"]
+  - file:
+      type: web
+      url: https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf
+    id: font_icon
+    size: 40
+    glyphs: ["\U000F009A", "\U000F01EE", "\U000F061C"]   # bell, email, dialpad
+  - file:
+      type: web
+      url: https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf
+    id: font_key
+    size: 32
+    glyphs: ["0123456789•"]
+    extras:
+      - file:
+          type: web
+          url: https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf
+        glyphs: ["\U000F0B5C", "\U000F012C"]   # backspace, check
+
+# Background (images/aurora.png next to this YAML)
+image:
+  - platform: file
+    file: images/aurora.png
+    id: bg_aurora
+    type: RGB565
+
+# Weather from Home Assistant
+text_sensor:
+  - platform: template
+    id: last_access
+    name: Last Access
+  - platform: homeassistant
+    id: weather_state
+    entity_id: ${weather_entity}
+    internal: true
+    on_value:
+      - script.execute: update_weather
+
+sensor:
+  - platform: homeassistant
+    id: weather_temp
+    entity_id: ${weather_entity}
+    attribute: temperature
+    internal: true
+    on_value:
+      - script.execute: update_weather
+
+  # Radar: how many people and how far away the closest is
+  - platform: ld2450
+    ld2450_id: door_radar
+    target_count:
+      name: Front Door People
+    target_1:
+      distance:
+        name: Front Door Target Distance
+        filters:
+          - delta: 100           # mm; only report 10 cm changes
+
+  # Ambient light: phototransistor on GPIO1 (3.3V -> sensor -> GPIO1 -> 10k -> GND)
+  - platform: adc
+    id: ambient_light
+    name: Ambient Light
+    pin: GPIO1
+    attenuation: 12db
+    update_interval: 500ms
+    unit_of_measurement: "%"
+    icon: mdi:brightness-5
+    accuracy_decimals: 0
+    filters:
+      - lambda: 'return x / 3.1f * 100.0f;'
+      - clamp:
+          min_value: 0
+          max_value: 100
+      - sliding_window_moving_average:   # average 4 readings -> new value every 2 s
+          window_size: 4
+          send_every: 4
+      - delta: 2                         # only report when it moves 2 % or more
+    on_value:
+      - script.execute: auto_brightness
+
+# Turn off in HA to set the screen brightness by hand
+switch:
+  - platform: template
+    id: auto_brightness_switch
+    name: Auto Brightness
+    icon: mdi:brightness-auto
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - lambda: 'id(last_auto_brightness) = -1;'   # force an update
+      - script.execute: auto_brightness
+    on_turn_off:
+      - script.stop: auto_brightness
+      - script.execute: apply_manual_brightness   # snap to the HA slider
+
+# Time from Home Assistant (uses HA's timezone)
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - script.execute: update_clock
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: update_clock
+
+lvgl:
+  displays: door_display
+  touchscreens: door_touch
+  default_font: font_text
+  style_definitions:
+    - id: glass_tile          # translucent tile over the background
+      bg_color: 0x000000
+      bg_opa: 35%
+      bg_grad_color: 0x000000
+      border_width: 1
+      border_color: 0xFFFFFF
+      border_opa: 12%
+      radius: 16
+      shadow_width: 0
+      text_color: 0xE6E8EB
+    - id: glass_pressed
+      bg_color: 0x03A9F4
+      bg_opa: 55%
+      bg_grad_color: 0x03A9F4
+  pages:
+    # ---------------- Main screen ----------------
+    - id: main_page
+      bg_image_src: bg_aurora
+      scrollable: false
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 22
+            text: "Front Door"
+            text_color: 0xE6E8EB
+        - obj:
+            align: TOP_MID
+            y: 50
+            width: SIZE_CONTENT
+            height: SIZE_CONTENT
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            layout:
+              type: flex
+              flex_flow: ROW
+              flex_align_cross: END
+              pad_column: 8
+            widgets:
+              - label:
+                  id: clock_time
+                  text: ""
+                  text_font: font_clock
+                  text_color: 0xE6E8EB
+              - label:
+                  id: clock_ampm
+                  text: ""
+                  text_color: 0xE6E8EB
+                  pad_bottom: 18
+        - label:
+            id: date_label
+            align: TOP_MID
+            y: 154
+            text: ""
+            text_align: CENTER
+            text_color: 0xE6E8EB
+        - label:
+            id: weather_label
+            align: TOP_MID
+            y: 186
+            text: ""
+            text_align: CENTER
+            text_font: font_weather
+            text_color: 0xE6E8EB
+        - label:
+            id: status_label
+            align: TOP_MID
+            y: 244
+            width: 290
+            long_mode: WRAP
+            text_align: CENTER
+            text: "Scan card, face or palm"
+            text_color: 0xE6E8EB
+        - button:
+            id: doorbell_button
+            align: BOTTOM_LEFT
+            x: 12
+            y: -16
+            width: 92
+            height: 110
+            styles: glass_tile
+            pressed:
+              styles: glass_pressed
+            on_click:
+              - script.execute: ring_doorbell
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: 14
+                  text: "\U000F009A"
+                  text_font: font_icon
+                  text_color: 0xE6E8EB
+              - label:
+                  align: BOTTOM_MID
+                  y: -10
+                  text: "Doorbell"
+                  text_font: font_small
+                  text_color: 0xE6E8EB
+        - button:
+            id: mail_button
+            align: BOTTOM_MID
+            y: -16
+            width: 92
+            height: 110
+            styles: glass_tile
+            pressed:
+              styles: glass_pressed
+            on_click:
+              - script.execute: mail_delivered
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: 14
+                  text: "\U000F01EE"
+                  text_font: font_icon
+                  text_color: 0xE6E8EB
+              - label:
+                  align: BOTTOM_MID
+                  y: -10
+                  text: "Mail"
+                  text_font: font_small
+                  text_color: 0xE6E8EB
+        - button:
+            id: pin_button
+            align: BOTTOM_RIGHT
+            x: -12
+            y: -16
+            width: 92
+            height: 110
+            styles: glass_tile
+            pressed:
+              styles: glass_pressed
+            on_click:
+              - lambda: 'id(pin_reader).clear();'
+              - lvgl.label.update:
+                  id: pin_dots
+                  text: ""
+              - lvgl.page.show: pin_page
+              - script.execute: pin_page_timeout
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: 14
+                  text: "\U000F061C"
+                  text_font: font_icon
+                  text_color: 0xE6E8EB
+              - label:
+                  align: BOTTOM_MID
+                  y: -10
+                  text: "PIN"
+                  text_font: font_small
+                  text_color: 0xE6E8EB
+
+    # ---------------- PIN pad ----------------
+    - id: pin_page
+      bg_image_src: bg_aurora
+      scrollable: false
+      widgets:
+        - label:
+            id: pin_title
+            align: TOP_MID
+            y: 16
+            width: 300
+            long_mode: WRAP
+            text_align: CENTER
+            text: "Enter PIN"
+            text_color: 0xE6E8EB
+        - label:
+            id: pin_dots
+            align: TOP_MID
+            y: 46
+            text: ""
+            text_font: font_key
+            text_color: 0xE6E8EB
+        - buttonmatrix:
+            id: pin_pad
+            scrollable: false
+            scroll_chain: false
+            align: TOP_MID
+            y: 92
+            width: 300
+            height: 290
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            pad_row: 10
+            pad_column: 10
+            items:
+              bg_color: 0x000000
+              bg_opa: 35%
+              bg_grad_color: 0x000000
+              border_width: 1
+              border_color: 0xFFFFFF
+              border_opa: 12%
+              text_color: 0xE6E8EB
+              text_font: font_key
+              radius: 16
+              shadow_width: 0
+              pressed:
+                bg_color: 0x03A9F4
+                bg_opa: 55%
+                bg_grad_color: 0x03A9F4
+            rows:
+              - buttons:
+                  - { text: "1", key_code: "1" }
+                  - { text: "2", key_code: "2" }
+                  - { text: "3", key_code: "3" }
+              - buttons:
+                  - { text: "4", key_code: "4" }
+                  - { text: "5", key_code: "5" }
+                  - { text: "6", key_code: "6" }
+              - buttons:
+                  - { text: "7", key_code: "7" }
+                  - { text: "8", key_code: "8" }
+                  - { text: "9", key_code: "9" }
+              - buttons:
+                  - { text: "\U000F0B5C", key_code: "<" }
+                  - { text: "0", key_code: "0" }
+                  - { text: "\U000F012C", key_code: "#" }
+        - button:
+            id: pin_exit_button
+            align: BOTTOM_MID
+            y: -18
+            width: 300
+            height: 64
+            styles: glass_tile
+            pressed:
+              styles: glass_pressed
+            on_click:
+              - script.execute: leave_pin_page
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Exit"
+                  text_color: 0xE6E8EB
+
+# PIN entry: the pad feeds a key collector (# = enter, < = backspace)
+key_collector:
+  - id: pin_reader
+    source_id: pin_pad
+    min_length: 4
+    max_length: 8
+    end_keys: "#"
+    end_key_required: true
+    back_keys: "<"
+    allowed_keys: "0123456789#<"
+    on_progress:
+      - script.execute: pin_page_timeout
+      - lvgl.label.update:
+          id: pin_dots
+          text: !lambda |-
+            std::string dots;
+            for (size_t i = 0; i < x.size(); i++) dots += "\u2022 ";
+            return dots;
+    on_result:
+      # Setting a PIN from the web page: save it instead of checking it
+      - if:
+          condition:
+            lambda: 'return id(pin_setup);'
+          then:
+            - lambda: |-
+                int r = id(door_access).submit_enrol_pin(x);
+                id(pin_reader).clear();
+                lv_label_set_text(id(pin_dots), "");
+                if (r == 2) {            // saved
+                  id(pin_setup) = false;
+                  lv_label_set_text(id(status_label), "PIN saved");
+                  lv_obj_set_style_text_color(id(status_label), lv_color_hex(0x4ADE80), 0);
+                  id(reset_status).execute();
+                  id(leave_pin_page).execute();
+                } else if (r == 3) {     // cancelled from the web page meanwhile
+                  id(leave_pin_page).execute();
+                } else {                 // confirm, or try again
+                  lv_label_set_text(id(pin_title), id(door_access).pin_enrol_prompt().c_str());
+                  lv_obj_set_style_text_color(id(pin_title),
+                      lv_color_hex(r == 1 ? 0xE6E8EB : 0xF87171), 0);
+                  id(pin_page_timeout).execute();
+                }
+          else:
+            - if:
+                condition:
+                  lambda: 'return millis() < id(pin_lockout_until);'
+                then:
+                  - lvgl.label.update:
+                      id: status_label
+                      text: "Too many wrong PINs.\nTry again shortly."
+                      text_color: 0xF87171
+                  - script.execute: reset_status
+                else:
+                  - lambda: |-
+                      if (id(door_access).handle_pin(x)) {
+                        id(pin_failures) = 0;
+                      } else if (++id(pin_failures) >= 5) {
+                        id(pin_failures) = 0;
+                        id(pin_lockout_until) = millis() + 60000;
+                        id(pin_locked_out).execute();
+                      }
+            - script.execute: leave_pin_page
+
+globals:
+  - id: last_auto_brightness
+    type: float
+    initial_value: '-1'
+  - id: pin_setup          # PIN pad is being used to set a PIN from the web page
+    type: bool
+    initial_value: 'false'
+  - id: pin_failures
+    type: int
+    initial_value: '0'
+  - id: pin_lockout_until
+    type: uint32_t
+    initial_value: '0'
+
+# Doorbell and mail show up in HA as event entities for automations
+event:
+  - platform: template
+    id: doorbell_event
+    name: Doorbell
+    device_class: doorbell
+    event_types:
+      - pressed
+  - platform: template
+    id: mail_event
+    name: Mail Delivered
+    event_types:
+      - pressed
+
+# Opens the PIN pad when "Set PIN" is pressed on the web page,
+# and closes it again if the web page cancels or it times out
+interval:
+  - interval: 300ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(door_access).pin_enrol_active() && !id(pin_setup);'
+          then:
+            - lambda: |-
+                id(pin_setup) = true;
+                id(pin_reader).clear();
+                lv_label_set_text(id(pin_dots), "");
+                lv_label_set_text(id(pin_title), id(door_access).pin_enrol_prompt().c_str());
+                lv_obj_set_style_text_color(id(pin_title), lv_color_hex(0xE6E8EB), 0);
+            - lvgl.page.show: pin_page
+            - script.execute: pin_page_timeout
+      - if:
+          condition:
+            lambda: 'return id(pin_setup) && !id(door_access).pin_enrol_active();'
+          then:
+            - script.execute: leave_pin_page
+
+script:
+  # Map ambient light (0-100 %) to backlight 15-100 %, only when it changes noticeably
+  - id: auto_brightness
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(auto_brightness_switch).state || isnan(id(ambient_light).state)) return false;
+              float b = id(radar_presence).state ? 0.15f + 0.85f * (id(ambient_light).state / 100.0f) : 0.05f;
+              return fabsf(b - id(last_auto_brightness)) >= 0.05f;
+          then:
+            # someone there: follow ambient light (15-100 %); nobody there: dim to 5 %
+            - lambda: |-
+                id(last_auto_brightness) = id(radar_presence).state
+                    ? 0.15f + 0.85f * (id(ambient_light).state / 100.0f) : 0.05f;
+            - logger.log:
+                format: "Auto brightness -> %.0f%% (light %.0f%%, %s)"
+                args:
+                  - 'id(last_auto_brightness) * 100.0f'
+                  - 'id(ambient_light).state'
+                  - 'id(radar_presence).state ? "someone there" : "nobody there"'
+            - light.turn_on:
+                id: backlight
+                brightness: !lambda 'return id(last_auto_brightness);'
+                transition_length: 2s
+
+  # Set the backlight to the HA "Screen Brightness" slider (0 % = off)
+  - id: apply_manual_brightness
+    then:
+      - lambda: |-
+          float x = id(screen_brightness).state;
+          if (isnan(x)) x = 80;
+          ESP_LOGI("backlight", "Manual brightness -> %.0f%%", x);
+          auto call = (x <= 0) ? id(backlight).turn_off() : id(backlight).turn_on();
+          if (x > 0) call.set_brightness(x / 100.0f);
+          call.perform();
+
+  - id: update_clock
+    then:
+      - lambda: |-
+          auto t = id(ha_time).now();
+          if (!t.is_valid()) return;
+          int h = t.hour % 12;
+          if (h == 0) h = 12;
+          char buf[40];
+          snprintf(buf, sizeof(buf), "%d:%02d", h, t.minute);
+          lv_label_set_text(id(clock_time), buf);
+          lv_label_set_text(id(clock_ampm), t.hour < 12 ? "AM" : "PM");
+          snprintf(buf, sizeof(buf), "%s, %d %s", t.strftime("%A").c_str(), t.day_of_month,
+                   t.strftime("%B").c_str());
+          lv_label_set_text(id(date_label), buf);
+
+  - id: update_weather
+    then:
+      - lambda: |-
+          const std::string &c = id(weather_state).state;
+          const char *icon = "\U000F05D6";
+          if (c == "sunny") icon = "\U000F0599";
+          else if (c == "clear-night") icon = "\U000F0594";
+          else if (c == "cloudy") icon = "\U000F0590";
+          else if (c == "partlycloudy") icon = "\U000F0595";
+          else if (c == "rainy") icon = "\U000F0597";
+          else if (c == "pouring") icon = "\U000F0596";
+          else if (c == "lightning") icon = "\U000F0593";
+          else if (c == "lightning-rainy") icon = "\U000F067E";
+          else if (c == "fog") icon = "\U000F0591";
+          else if (c == "hail") icon = "\U000F0592";
+          else if (c == "snowy") icon = "\U000F0598";
+          else if (c == "snowy-rainy") icon = "\U000F067F";
+          else if (c == "windy") icon = "\U000F059D";
+          else if (c == "windy-variant") icon = "\U000F059E";
+          char buf[40];
+          if (isnan(id(weather_temp).state))
+            snprintf(buf, sizeof(buf), "%s", icon);
+          else
+            snprintf(buf, sizeof(buf), "%s  %.0f°C", icon, id(weather_temp).state);
+          lv_label_set_text(id(weather_label), buf);
+
+  - id: reset_status
+    mode: restart
+    then:
+      - delay: 4s
+      - lvgl.label.update:
+          id: status_label
+          text: "Scan card, face or palm"
+          text_color: 0xE6E8EB
+
+  - id: ring_doorbell
+    mode: single          # ignore repeat presses for 10 s
+    then:
+      - event.trigger:
+          id: doorbell_event
+          event_type: pressed
+      - lvgl.label.update:
+          id: status_label
+          text: "Ringing..."
+          text_color: 0xE6E8EB
+      - script.execute: reset_status
+      - delay: 10s
+
+  - id: mail_delivered
+    mode: single
+    then:
+      - event.trigger:
+          id: mail_event
+          event_type: pressed
+      - lvgl.label.update:
+          id: status_label
+          text: "Thanks - we've been notified"
+          text_color: 0xE6E8EB
+      - script.execute: reset_status
+      - delay: 10s
+
+  - id: pin_page_timeout   # back to the main screen after 30 s idle
+    mode: restart
+    then:
+      - delay: 30s
+      - script.execute: leave_pin_page
+
+  - id: leave_pin_page
+    then:
+      - script.stop: pin_page_timeout
+      - lambda: |-
+          if (id(pin_setup)) {
+            id(pin_setup) = false;
+            id(door_access).cancel_pin_enrol();   // Exit / idle during PIN setup
+          }
+          lv_label_set_text(id(pin_title), "Enter PIN");
+          lv_obj_set_style_text_color(id(pin_title), lv_color_hex(0xE6E8EB), 0);
+      - lambda: 'id(pin_reader).clear();'
+      - lvgl.label.update:
+          id: pin_dots
+          text: ""
+      - lvgl.page.show: main_page
+
+  - id: pin_locked_out
+    then:
+      - lvgl.label.update:
+          id: status_label
+          text: "Too many wrong PINs.\nLocked for 60 s."
+          text_color: 0xF87171
+      - script.execute: reset_status

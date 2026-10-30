@@ -116,4 +116,6 @@ Note: on YD-ESP32-S3 clone boards the 5 V pin may need the IN-OUT solder pad bri
 - Wi-Fi credentials are not stored in this repo; the ESPHome config uses `!secret iot_wifi_ssid` and `!secret iot_wifi_password`.
 
 ## Firmware
-The ESPHome YAML (`access-panel-front.yaml`) and `components/access_control/` are to be added.
+- `access-panel-front.yaml`: full ESPHome config (screen UI, PIN pad, doorbell/mail events, radar, auto-brightness, speaker, FP008 + Wiegand).
+- Still to add: `components/access_control/` (custom component: `__init__.py`, `access_control.cpp`, `access_control.h`, `web_page.h`) and `images/aurora.png` (background image referenced by the YAML). The YAML will not compile without them.
+- Lock relay, reed switch and exit button are not in this YAML yet.
