@@ -117,5 +117,7 @@ Note: on YD-ESP32-S3 clone boards the 5 V pin may need the IN-OUT solder pad bri
 
 ## Firmware
 - `access-panel-front.yaml`: full ESPHome config (screen UI, PIN pad, doorbell/mail events, radar, auto-brightness, speaker, FP008 + Wiegand).
-- Still to add: `components/access_control/` (custom component: `__init__.py`, `access_control.cpp`, `access_control.h`, `web_page.h`) and `images/aurora.png` (background image referenced by the YAML). The YAML will not compile without them.
+- `components/access_control/`: custom ESPHome component (FP008 face/palm UART driver, profile storage in flash, on-device web page for users/cards/PINs/faces/palms, PIN setup from the door panel). **Rebuilt from the original source in an earlier chat plus its later edits; not compiled or tested after rebuilding.** If it fails to build, tell me the error.
+- `images/aurora.png`: background image. Regenerated approximation of the original (the exact file wasn't recoverable); `tools/generate_aurora.py` recreates it.
+- Copy `access-panel-front.yaml`, `components/` and `images/` into your ESPHome config folder (e.g. `homeassistant/esphome/`).
 - Lock relay, reed switch and exit button are not in this YAML yet.
